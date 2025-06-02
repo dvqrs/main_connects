@@ -1,52 +1,34 @@
 import os
 import sqlite3
 import hashlib
-import hmac      # ← compare_digest
+import hmac
 import binascii
 import json
 import base64
 import threading
 from flask import Flask, request, make_response
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Configuration (unchanged)
-# ────────────────────────────────────────────────────────────────────────────────
-
 DB_FILENAME       = "users.db"
 PBKDF2_ITERATIONS = 100_000
 HASH_NAME         = "sha256"
 
-SHARED_KEY = os.environ.get("SHARED_SECRET", None)
+SHARED_KEY = os.environ.get("SHARED_SECRET")
 if SHARED_KEY is None:
     raise RuntimeError("You must set SHARED_SECRET in the environment!")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Simple global lock to serialize all SQLite operations
-# ────────────────────────────────────────────────────────────────────────────────
-
 db_lock = threading.Lock()
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Password–hashing helpers (unchanged)
-# ────────────────────────────────────────────────────────────────────────────────
 
 def generate_salt(length: int = 16) -> bytes:
     return os.urandom(length)
 
 def hash_password(password: str, salt: bytes) -> bytes:
-    pwd_bytes = password.encode("utf-8")
-    dk = hashlib.pbkdf2_hmac(HASH_NAME, pwd_bytes, salt, PBKDF2_ITERATIONS)
-    return dk
+    return hashlib.pbkdf2_hmac(HASH_NAME, password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
 
 def verify_password(stored_hash_hex: str, stored_salt_hex: str, provided_password: str) -> bool:
     salt = binascii.unhexlify(stored_salt_hex)
     expected_hash = binascii.unhexlify(stored_hash_hex)
     provided_hash = hash_password(provided_password, salt)
     return hmac.compare_digest(expected_hash, provided_hash)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# XOR + Base64 “encryption” helpers (unchanged)
-# ────────────────────────────────────────────────────────────────────────────────
 
 def _xor_bytes(data: bytes, key: bytes) -> bytes:
     out = bytearray(len(data))
@@ -59,8 +41,7 @@ def encrypt_and_encode(plaintext: str) -> str:
     raw       = plaintext.encode("utf-8")
     key_bytes = SHARED_KEY.encode("utf-8")
     xored     = _xor_bytes(raw, key_bytes)
-    b64       = base64.b64encode(xored)
-    return b64.decode("ascii")
+    return base64.b64encode(xored).decode("ascii")
 
 def decode_and_decrypt(cipher_b64: str) -> str:
     try:
@@ -71,13 +52,7 @@ def decode_and_decrypt(cipher_b64: str) -> str:
     except Exception:
         return ""
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Database setup (unchanged, but we open with check_same_thread=False)
-# ────────────────────────────────────────────────────────────────────────────────
-
 def init_db():
-    # Always open with check_same_thread=False, even if single‐threaded now, 
-    # so that we can acquire the lock and use the connection safely in any thread.
     conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
@@ -93,12 +68,12 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Flask app
-# ────────────────────────────────────────────────────────────────────────────────
-
 app = Flask(__name__)
-init_db()   # create the table if it doesn’t exist
+init_db()
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
 
 @app.route("/signup", methods=["POST"])
 def signup():
@@ -137,7 +112,6 @@ def signup():
     hash_hex   = binascii.hexlify(hash_bytes).decode("ascii")
 
     try:
-        # Acquire the lock so nobody else writes at the same time.
         with db_lock:
             conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
             cursor = conn.cursor()
@@ -148,7 +122,6 @@ def signup():
             conn.commit()
             conn.close()
     except sqlite3.IntegrityError:
-        # Username already taken
         return _encrypted_response({"success": False, "message": "Username already exists"}, 409)
     except Exception as e:
         return _encrypted_response({"success": False, "message": f"Database error: {e}"}, 500)
@@ -199,7 +172,6 @@ def login():
     if not verify_password(stored_hash_hex, stored_salt_hex, password):
         return _encrypted_response({"success": False, "message": "Invalid username or password"}, 401)
 
-    # Include both plan and credit_card in the response
     return _encrypted_response({
         "success": True,
         "message": "Login successful",
@@ -215,7 +187,4 @@ def _encrypted_response(payload_dict, http_status):
     return response
 
 if __name__ == "__main__":
-    # ────────────────────────────────────────────────────────────────────────────────
-    # Run Flask in threaded mode, so multiple requests can happen at once:
-    # ────────────────────────────────────────────────────────────────────────────────
     app.run(host="0.0.0.0", port=5000, threaded=True)
