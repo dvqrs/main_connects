@@ -1,8 +1,7 @@
-# server_main_connects.py
-
 import os
 import sqlite3
 import hashlib
+import hmac      # ← import hmac for compare_digest
 import binascii
 import json
 import base64
@@ -21,7 +20,7 @@ if SHARED_KEY is None:
     raise RuntimeError("You must set SHARED_SECRET in the environment!")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Password‐hashing helpers (unchanged)
+# Password‐hashing helpers
 # ────────────────────────────────────────────────────────────────────────────────
 
 def generate_salt(length: int = 16) -> bytes:
@@ -33,10 +32,15 @@ def hash_password(password: str, salt: bytes) -> bytes:
     return dk
 
 def verify_password(stored_hash_hex: str, stored_salt_hex: str, provided_password: str) -> bool:
-    salt       = binascii.unhexlify(stored_salt_hex)
-    expected   = binascii.unhexlify(stored_hash_hex)
-    provided_h = hash_password(provided_password, salt)
-    return hashlib.compare_digest(expected, provided_h)
+    """
+    Compare stored hash (hex) + salt (hex) against hash of provided_password.
+    Uses hmac.compare_digest to avoid timing attacks.
+    """
+    salt = binascii.unhexlify(stored_salt_hex)
+    expected_hash = binascii.unhexlify(stored_hash_hex)
+    provided_hash = hash_password(provided_password, salt)
+    # Use hmac.compare_digest instead of hashlib.compare_digest
+    return hmac.compare_digest(expected_hash, provided_hash)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # XOR + Base64 “encryption” helpers (unchanged)
@@ -50,23 +54,23 @@ def _xor_bytes(data: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 def encrypt_and_encode(plaintext: str) -> str:
-    raw      = plaintext.encode("utf-8")
+    raw       = plaintext.encode("utf-8")
     key_bytes = SHARED_KEY.encode("utf-8")
-    xored    = _xor_bytes(raw, key_bytes)
-    b64      = base64.b64encode(xored)
+    xored     = _xor_bytes(raw, key_bytes)
+    b64       = base64.b64encode(xored)
     return b64.decode("ascii")
 
 def decode_and_decrypt(cipher_b64: str) -> str:
     try:
-        xored    = base64.b64decode(cipher_b64)
+        xored     = base64.b64decode(cipher_b64)
         key_bytes = SHARED_KEY.encode("utf-8")
-        raw      = _xor_bytes(xored, key_bytes)
+        raw       = _xor_bytes(xored, key_bytes)
         return raw.decode("utf-8")
     except Exception:
         return ""
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Database setup
+# Database setup (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -91,17 +95,8 @@ def init_db():
 
 app = Flask(__name__)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Remove this decorator altogether:
-#
-# @app.before_first_request
-# def on_startup():
-#     init_db()
-# ────────────────────────────────────────────────────────────────────────────────
-
-# Instead, just call init_db() once, right now:
+# Initialize DB immediately, instead of using @before_first_request
 init_db()
-
 
 @app.route("/signup", methods=["POST"])
 def signup():
@@ -134,7 +129,6 @@ def signup():
     if not credit_card:
         return _encrypted_response({"success": False, "message": "Credit card is required"}, 400)
 
-    # Hash + salt
     salt_bytes = generate_salt()
     hash_bytes = hash_password(password, salt_bytes)
     salt_hex   = binascii.hexlify(salt_bytes).decode("ascii")
@@ -155,7 +149,6 @@ def signup():
         return _encrypted_response({"success": False, "message": f"Database error: {e}"}, 500)
 
     return _encrypted_response({"success": True, "message": "Registered successfully"}, 201)
-
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -184,8 +177,8 @@ def login():
     cursor = conn.cursor()
     cursor.execute("""
         SELECT password_hash, salt
-        FROM users
-        WHERE username = ?
+          FROM users
+         WHERE username = ?
     """, (username,))
     row = cursor.fetchone()
     conn.close()
@@ -199,7 +192,6 @@ def login():
 
     return _encrypted_response({"success": True, "message": "Login successful"}, 200)
 
-
 def _encrypted_response(payload_dict, http_status):
     plaintext_json = json.dumps(payload_dict)
     encrypted_b64  = encrypt_and_encode(plaintext_json)
@@ -207,7 +199,5 @@ def _encrypted_response(payload_dict, http_status):
     response.headers["Content-Type"] = "text/plain"
     return response
 
-
 if __name__ == "__main__":
-    # On Railway, they handle HTTPS for you—just bind to 0.0.0.0:5000
     app.run(host="0.0.0.0", port=5000)
