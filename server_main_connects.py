@@ -39,7 +39,6 @@ def verify_password(stored_hash_hex: str, stored_salt_hex: str, provided_passwor
     salt = binascii.unhexlify(stored_salt_hex)
     expected_hash = binascii.unhexlify(stored_hash_hex)
     provided_hash = hash_password(provided_password, salt)
-    # Use hmac.compare_digest instead of hashlib.compare_digest
     return hmac.compare_digest(expected_hash, provided_hash)
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -94,9 +93,7 @@ def init_db():
 # ────────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-
-# Initialize DB immediately, instead of using @before_first_request
-init_db()
+init_db()   # create the table if it doesn’t exist
 
 @app.route("/signup", methods=["POST"])
 def signup():
@@ -176,7 +173,7 @@ def login():
     conn   = sqlite3.connect(DB_FILENAME)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT password_hash, salt
+        SELECT password_hash, salt, plan, credit_card
           FROM users
          WHERE username = ?
     """, (username,))
@@ -186,11 +183,17 @@ def login():
     if row is None:
         return _encrypted_response({"success": False, "message": "Invalid username or password"}, 401)
 
-    stored_hash_hex, stored_salt_hex = row
+    stored_hash_hex, stored_salt_hex, user_plan, user_cc = row
     if not verify_password(stored_hash_hex, stored_salt_hex, password):
         return _encrypted_response({"success": False, "message": "Invalid username or password"}, 401)
 
-    return _encrypted_response({"success": True, "message": "Login successful"}, 200)
+    # Include both plan and credit_card in the response
+    return _encrypted_response({
+        "success": True,
+        "message": "Login successful",
+        "plan": user_plan,
+        "credit_card": user_cc
+    }, 200)
 
 def _encrypted_response(payload_dict, http_status):
     plaintext_json = json.dumps(payload_dict)
