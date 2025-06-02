@@ -1,10 +1,11 @@
 import os
 import sqlite3
 import hashlib
-import hmac      # ← import hmac for compare_digest
+import hmac      # ← compare_digest
 import binascii
 import json
 import base64
+import threading
 from flask import Flask, request, make_response
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -20,7 +21,13 @@ if SHARED_KEY is None:
     raise RuntimeError("You must set SHARED_SECRET in the environment!")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Password‐hashing helpers
+# Simple global lock to serialize all SQLite operations
+# ────────────────────────────────────────────────────────────────────────────────
+
+db_lock = threading.Lock()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Password–hashing helpers (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def generate_salt(length: int = 16) -> bytes:
@@ -32,10 +39,6 @@ def hash_password(password: str, salt: bytes) -> bytes:
     return dk
 
 def verify_password(stored_hash_hex: str, stored_salt_hex: str, provided_password: str) -> bool:
-    """
-    Compare stored hash (hex) + salt (hex) against hash of provided_password.
-    Uses hmac.compare_digest to avoid timing attacks.
-    """
     salt = binascii.unhexlify(stored_salt_hex)
     expected_hash = binascii.unhexlify(stored_hash_hex)
     provided_hash = hash_password(provided_password, salt)
@@ -69,11 +72,13 @@ def decode_and_decrypt(cipher_b64: str) -> str:
         return ""
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Database setup (unchanged)
+# Database setup (unchanged, but we open with check_same_thread=False)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def init_db():
-    conn   = sqlite3.connect(DB_FILENAME)
+    # Always open with check_same_thread=False, even if single‐threaded now, 
+    # so that we can acquire the lock and use the connection safely in any thread.
+    conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -132,15 +137,18 @@ def signup():
     hash_hex   = binascii.hexlify(hash_bytes).decode("ascii")
 
     try:
-        conn   = sqlite3.connect(DB_FILENAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO users (username, password_hash, salt, plan, credit_card)
-            VALUES (?, ?, ?, ?, ?)
-        """, (username, hash_hex, salt_hex, plan, credit_card))
-        conn.commit()
-        conn.close()
+        # Acquire the lock so nobody else writes at the same time.
+        with db_lock:
+            conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (username, password_hash, salt, plan, credit_card)
+                VALUES (?, ?, ?, ?, ?)
+            """, (username, hash_hex, salt_hex, plan, credit_card))
+            conn.commit()
+            conn.close()
     except sqlite3.IntegrityError:
+        # Username already taken
         return _encrypted_response({"success": False, "message": "Username already exists"}, 409)
     except Exception as e:
         return _encrypted_response({"success": False, "message": f"Database error: {e}"}, 500)
@@ -170,15 +178,19 @@ def login():
     if not password:
         return _encrypted_response({"success": False, "message": "Password is required"}, 400)
 
-    conn   = sqlite3.connect(DB_FILENAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT password_hash, salt, plan, credit_card
-          FROM users
-         WHERE username = ?
-    """, (username,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        with db_lock:
+            conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT password_hash, salt, plan, credit_card
+                  FROM users
+                 WHERE username = ?
+            """, (username,))
+            row = cursor.fetchone()
+            conn.close()
+    except Exception as e:
+        return _encrypted_response({"success": False, "message": f"Database error: {e}"}, 500)
 
     if row is None:
         return _encrypted_response({"success": False, "message": "Invalid username or password"}, 401)
@@ -203,4 +215,7 @@ def _encrypted_response(payload_dict, http_status):
     return response
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # ────────────────────────────────────────────────────────────────────────────────
+    # Run Flask in threaded mode, so multiple requests can happen at once:
+    # ────────────────────────────────────────────────────────────────────────────────
+    app.run(host="0.0.0.0", port=5000, threaded=True)
