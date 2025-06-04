@@ -111,7 +111,6 @@ def signup():
     salt_hex   = binascii.hexlify(salt_bytes).decode("ascii")
     hash_hex   = binascii.hexlify(hash_bytes).decode("ascii")
 
-    # Always open the connection *before* the try, so we can close it in every branch.
     with db_lock:
         conn   = sqlite3.connect(DB_FILENAME, check_same_thread=False)
         cursor = conn.cursor()
@@ -122,11 +121,9 @@ def signup():
             """, (username, hash_hex, salt_hex, plan, credit_card))
             conn.commit()
         except sqlite3.IntegrityError:
-            # Close the connection before returning 409
             conn.close()
             return _encrypted_response({"success": False, "message": "Username already exists"}, 409)
         except Exception as e:
-            # Close the connection before returning 500
             conn.close()
             return _encrypted_response({"success": False, "message": f"Database error: {e}"}, 500)
         else:
